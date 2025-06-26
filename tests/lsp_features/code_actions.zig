@@ -833,6 +833,76 @@ test "convert string literal to multiline - invalid" {
     );
 }
 
+test "missing symbol imports" {
+    // This test should trigger our new code action for undeclared identifiers
+    try testMissingSymbolImports(
+        \\const std = @import("std");
+        \\
+        \\pub fn main() void {
+        \\    const result = undefined_function();
+        \\    _ = result;
+        \\}
+        \\
+    );
+}
+
+fn testMissingSymbolImports(before: []const u8) !void {
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    var phr = try helper.collectClearPlaceholders(allocator, before);
+    defer phr.deinit(allocator);
+    const placeholders = phr.locations.items(.new);
+    const source = phr.new_source;
+
+    const range: types.Range = switch (placeholders.len) {
+        0 => .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = offsets.indexToPosition(before, before.len, ctx.server.offset_encoding),
+        },
+        1 => blk: {
+            const point = offsets.indexToPosition(before, placeholders[0].start, ctx.server.offset_encoding);
+            break :blk .{ .start = point, .end = point };
+        },
+        else => unreachable,
+    };
+
+    const uri = try ctx.addDocument(.{ .source = source });
+    const handle = ctx.server.document_store.getHandle(uri).?;
+
+    const params: types.CodeActionParams = .{
+        .textDocument = .{ .uri = uri },
+        .range = range,
+        .context = .{
+            .diagnostics = &.{},
+            .only = &.{types.CodeActionKind.quickfix},
+        },
+    };
+
+    @setEvalBranchQuota(5000);
+    const response = try ctx.server.sendRequestSync(ctx.arena.allocator(), "textDocument/codeAction", params) orelse {
+        std.debug.print("Server returned `null` as the result\n", .{});
+        return error.InvalidResponse;
+    };
+
+    // For now, just check that we get some response
+    // In the future, we'll check for specific code actions
+
+    // Check that our code action was created
+    var found_our_action = false;
+    for (response) |action| {
+        const code_action: types.CodeAction = action.CodeAction;
+        if (std.mem.eql(u8, code_action.title, "Add missing imports (placeholder)")) {
+            found_our_action = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_our_action);
+
+    // Use handle to avoid unused variable warning
+    _ = handle;
+}
+
 fn testAutofix(before: []const u8, after: []const u8) !void {
     try testDiagnostic(before, after, .{ .filter_kind = .@"source.fixAll", .want_zir = true }); // diagnostics come from std.zig.AstGen
     try testDiagnostic(before, after, .{ .filter_kind = .@"source.fixAll", .want_zir = false }); // diagnostics come from calling zig ast-check

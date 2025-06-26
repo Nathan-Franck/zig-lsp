@@ -61,7 +61,10 @@ pub const Builder = struct {
                     .@"error capture" => try handleUnusedCapture(builder, loc, &remove_capture_actions),
                 },
                 // the undeclared identifier may be a discard
-                .undeclared_identifier => try handlePointlessDiscard(builder, loc),
+                .undeclared_identifier => {
+                    try handlePointlessDiscard(builder, loc);
+                    try handleMissingSymbolImports(builder);
+                },
                 .unreachable_code => {
                     // TODO
                     // autofix: comment out code
@@ -1212,4 +1215,35 @@ test getCaptureLoc {
     try std.testing.expect(getCaptureLoc("||", .{ .start = 1, .end = 1 }) == null);
     try std.testing.expect(getCaptureLoc("| |", .{ .start = 1, .end = 3 }) == null);
     try std.testing.expect(getCaptureLoc("|    |", .{ .start = 1, .end = 6 }) == null);
+}
+
+fn handleMissingSymbolImports(builder: *Builder) !void {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    if (!builder.wantKind(.quickfix)) return;
+
+    // Check if we've already added this code action
+    for (builder.actions.items) |action| {
+        if (std.mem.eql(u8, action.title, "Add missing imports (placeholder)")) {
+            return; // Already added, don't add again
+        }
+    }
+
+    // For now, just log a message
+    std.log.info("hello code actions!", .{});
+
+    // Create a simple code action to verify it's working
+    try builder.actions.append(builder.arena, .{
+        .title = "Add missing imports (placeholder)",
+        .kind = .quickfix,
+        .isPreferred = false,
+        .edit = try builder.createWorkspaceEdit(&.{}),
+    });
+
+    // TODO: Implement actual missing symbol import logic
+    // 1. Collect all undeclared identifier errors
+    // 2. For each error, find the closest matching symbol
+    // 3. Generate import statements
+    // 4. Create code action
 }
