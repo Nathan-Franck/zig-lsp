@@ -1230,20 +1230,14 @@ fn handleMissingSymbolImports(builder: *Builder) !void {
         }
     }
 
-    // For now, just log a message
-    std.log.info("hello code actions!", .{});
+    // Insert a comment at the top of the file
+    const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
+    const edit = builder.createTextEditLoc(insert_loc, "// TODO: add missing imports\n");
 
-    // Create a simple code action to verify it's working
     try builder.actions.append(builder.arena, .{
         .title = "Add missing imports (placeholder)",
         .kind = .quickfix,
         .isPreferred = false,
-        .edit = try builder.createWorkspaceEdit(&.{}),
+        .edit = try builder.createWorkspaceEdit(&.{edit}),
     });
-
-    // TODO: Implement actual missing symbol import logic
-    // 1. Collect all undeclared identifier errors
-    // 2. For each error, find the closest matching symbol
-    // 3. Generate import statements
-    // 4. Create code action
 }
