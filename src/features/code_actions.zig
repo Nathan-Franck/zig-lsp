@@ -11,6 +11,87 @@ const ast = @import("../ast.zig");
 const types = @import("lsp").types;
 const offsets = @import("../offsets.zig");
 const tracy = @import("tracy");
+const log = std.log.scoped(.code_actions);
+const URI = @import("../uri.zig");
+
+const MatchingSymbol = struct {
+    name: []const u8,
+    line: usize,
+    column: usize,
+    relative_path: []const u8,
+    depth: usize,
+};
+
+const SymbolInfo = struct {
+    name: []const u8,
+    line: usize,
+    column: usize,
+};
+
+const FileSymbols = struct {
+    file_path: []const u8,
+    symbols: std.ArrayList(SymbolInfo),
+};
+
+// Function to collect all Zig files in the workspace
+fn collectZigFiles(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    files: *std.ArrayList([]const u8),
+) !void {
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind == .directory) {
+            if (std.mem.eql(u8, entry.name, ".zig-cache")) continue;
+            const sub_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
+            defer allocator.free(sub_path);
+            try collectZigFiles(allocator, sub_path, files);
+        } else if (entry.kind == .file) {
+            if (std.mem.endsWith(u8, entry.name, ".zig")) {
+                const file_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
+                try files.append(file_path);
+            }
+        }
+    }
+}
+
+// Function to extract top-level symbols from a file
+fn topLevelSymbols(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+) !FileSymbols {
+    var file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    const buffer = try allocator.alloc(u8, stat.size + 1);
+    _ = try file.readAll(buffer[0..stat.size]);
+    buffer[stat.size] = 0; // null-terminate
+    var tree = try Ast.parse(allocator, buffer[0..stat.size :0], .zig);
+    defer tree.deinit(allocator);
+
+    var doc_scope = try DocumentScope.init(allocator, tree);
+    defer doc_scope.deinit(allocator);
+
+    var symbols = std.ArrayList(SymbolInfo).init(allocator);
+    const root_scope = DocumentScope.Scope.Index.root;
+    for (doc_scope.getScopeDeclarationsConst(root_scope)) |decl_index| {
+        const decl = doc_scope.declarations.get(@intFromEnum(decl_index));
+        if (decl == .ast_node) {
+            const name_token = decl.nameToken(tree);
+            const name = offsets.identifierTokenToNameSlice(tree, name_token);
+            const node = decl.ast_node;
+            const loc = offsets.nodeToLoc(tree, node);
+            const pos = offsets.indexToPosition(buffer[0..stat.size], loc.start, .@"utf-8");
+            try symbols.append(.{ .name = name, .line = pos.line + 1, .column = pos.character + 1 });
+        }
+    }
+    return FileSymbols{
+        .file_path = file_path,
+        .symbols = symbols,
+    };
+}
 
 pub const Builder = struct {
     arena: std.mem.Allocator,
@@ -63,7 +144,7 @@ pub const Builder = struct {
                 // the undeclared identifier may be a discard
                 .undeclared_identifier => {
                     try handlePointlessDiscard(builder, loc);
-                    try handleMissingSymbolImports(builder);
+                    try handleMissingSymbolImports(builder, loc);
                 },
                 .unreachable_code => {
                     // TODO
@@ -134,6 +215,26 @@ pub const Builder = struct {
         try workspace_edit.changes.?.map.putNoClobber(self.arena, self.handle.uri, try self.arena.dupe(types.TextEdit, edits));
 
         return workspace_edit;
+    }
+
+    /// Converts a file URI to a relative import path for the current file
+    pub fn getImportPathFromUri(self: *Builder, file_uri: []const u8) error{ OutOfMemory, UnexpectedCharacter, InvalidFormat, InvalidPort }![]const u8 {
+        const current_file_path = try URI.parse(self.arena, self.handle.uri);
+        defer self.arena.free(current_file_path);
+        const target_file_path = try URI.parse(self.arena, file_uri);
+        defer self.arena.free(target_file_path);
+
+        const current_dir = std.fs.path.dirname(current_file_path).?;
+        const target_file_name = std.fs.path.basename(target_file_path);
+
+        // If files are in the same directory, just use the filename
+        if (std.mem.eql(u8, current_dir, std.fs.path.dirname(target_file_path).?)) {
+            return try self.arena.dupe(u8, target_file_name);
+        }
+
+        // For now, just return the filename as a simple approach
+        // TODO: Implement proper relative path calculation
+        return try self.arena.dupe(u8, target_file_name);
     }
 };
 
@@ -1217,11 +1318,13 @@ test getCaptureLoc {
     try std.testing.expect(getCaptureLoc("|    |", .{ .start = 1, .end = 6 }) == null);
 }
 
-fn handleMissingSymbolImports(builder: *Builder) !void {
+fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
     if (!builder.wantKind(.quickfix)) return;
+
+    const identifier_name = offsets.locToSlice(builder.handle.tree.source, loc);
 
     // Check if we've already added this code action
     for (builder.actions.items) |action| {
@@ -1230,14 +1333,105 @@ fn handleMissingSymbolImports(builder: *Builder) !void {
         }
     }
 
-    // Insert a comment at the top of the file
-    const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
-    const edit = builder.createTextEditLoc(insert_loc, "// TODO: add missing imports\n");
+    // Get current file path from URI
+    const current_file_path = URI.parse(builder.arena, builder.handle.uri) catch |err| {
+        log.debug("Failed to parse URI: {}", .{err});
+        return;
+    };
+    defer builder.arena.free(current_file_path);
+    const current_dir = std.fs.path.dirname(current_file_path) orelse ".";
 
-    try builder.actions.append(builder.arena, .{
-        .title = "Add missing imports (placeholder)",
-        .kind = .quickfix,
-        .isPreferred = false,
-        .edit = try builder.createWorkspaceEdit(&.{edit}),
-    });
+    // Collect all Zig files in the workspace
+    var files = std.ArrayList([]const u8).init(builder.arena);
+    defer {
+        for (files.items) |file| builder.arena.free(file);
+        files.deinit();
+    }
+    collectZigFiles(builder.arena, ".", &files) catch |err| {
+        log.debug("Failed to collect Zig files: {}", .{err});
+        return;
+    };
+
+    // Extract symbols from all files
+    var file_symbols = std.ArrayList(FileSymbols).init(builder.arena);
+    defer {
+        for (file_symbols.items) |fs| fs.symbols.deinit();
+        file_symbols.deinit();
+    }
+    for (files.items) |file| {
+        const fs = topLevelSymbols(builder.arena, file) catch |err| {
+            log.debug("[error: {}] {s}", .{ err, file });
+            continue;
+        };
+        try file_symbols.append(fs);
+    }
+
+    // Find matching symbols
+    var matching_symbols = std.ArrayList(MatchingSymbol).init(builder.arena);
+    defer matching_symbols.deinit();
+
+    for (file_symbols.items) |fs| {
+        for (fs.symbols.items) |sym| {
+            if (std.mem.eql(u8, sym.name, identifier_name)) {
+                const relative_path = std.fs.path.relative(builder.arena, current_dir, fs.file_path) catch |err| {
+                    log.debug("Failed to get relative path: {}", .{err});
+                    continue;
+                };
+
+                var depth: usize = 0;
+                for (relative_path) |c| {
+                    if (c == std.fs.path.sep) depth += 1;
+                }
+
+                try matching_symbols.append(.{
+                    .name = sym.name,
+                    .line = sym.line,
+                    .column = sym.column,
+                    .relative_path = relative_path,
+                    .depth = depth,
+                });
+            }
+        }
+    }
+
+    // Sort by depth (closest files first)
+    std.mem.sort(MatchingSymbol, matching_symbols.items, {}, struct {
+        fn lessThan(_: void, a: MatchingSymbol, b: MatchingSymbol) bool {
+            return a.depth < b.depth;
+        }
+    }.lessThan);
+
+    // Create import suggestions for each matching symbol
+    for (matching_symbols.items) |sym| {
+        // Skip if it's the same file
+        if (std.mem.eql(u8, sym.relative_path, std.fs.path.basename(current_file_path))) continue;
+
+        // Convert relative path to import path (remove .zig extension)
+        const import_path = if (std.mem.endsWith(u8, sym.relative_path, ".zig"))
+            sym.relative_path[0 .. sym.relative_path.len - 4]
+        else
+            sym.relative_path;
+
+        const import_stmt = try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\");\n", .{ identifier_name, import_path });
+        const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
+        const edit = builder.createTextEditLoc(insert_loc, import_stmt);
+        try builder.actions.append(builder.arena, .{
+            .title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, import_path }),
+            .kind = .quickfix,
+            .isPreferred = false,
+            .edit = try builder.createWorkspaceEdit(&.{edit}),
+        });
+    }
+
+    // If no matches found, add a placeholder action
+    if (matching_symbols.items.len == 0) {
+        const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
+        const edit = builder.createTextEditLoc(insert_loc, "// TODO: add missing imports\n");
+        try builder.actions.append(builder.arena, .{
+            .title = "Add missing imports (placeholder)",
+            .kind = .quickfix,
+            .isPreferred = false,
+            .edit = try builder.createWorkspaceEdit(&.{edit}),
+        });
+    }
 }
