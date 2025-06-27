@@ -25,12 +25,27 @@ fn collectZigFiles(
     }
 }
 
-fn printTopLevelSymbols(allocator: std.mem.Allocator, file_path: []const u8) !void {
+const offsets_mod = @import("offsets.zig");
+
+const SymbolInfo = struct {
+    name: []const u8,
+    line: usize,
+    column: usize,
+};
+
+const FileSymbols = struct {
+    file_path: []const u8,
+    symbols: std.ArrayList(SymbolInfo),
+};
+
+fn topLevelSymbols(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+) !FileSymbols {
     var file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
     const stat = try file.stat();
     const buffer = try allocator.alloc(u8, stat.size + 1);
-    defer allocator.free(buffer);
     _ = try file.readAll(buffer[0..stat.size]);
     buffer[stat.size] = 0; // null-terminate
     var tree = try Ast.parse(allocator, buffer[0..stat.size :0], .zig);
@@ -39,39 +54,62 @@ fn printTopLevelSymbols(allocator: std.mem.Allocator, file_path: []const u8) !vo
     var doc_scope = try DocumentScope.init(allocator, tree);
     defer doc_scope.deinit(allocator);
 
-    const offsets_mod = @import("offsets.zig");
-
-    // Print all top-level declarations (root scope)
+    var symbols = std.ArrayList(SymbolInfo).init(allocator);
     const root_scope = DocumentScope.Scope.Index.root;
     for (doc_scope.getScopeDeclarationsConst(root_scope)) |decl_index| {
         const decl = doc_scope.declarations.get(@intFromEnum(decl_index));
-        const name = doc_scope.declaration_lookup_map.keys()[@intFromEnum(decl_index)].name;
         if (decl == .ast_node) {
+            const name_token = decl.nameToken(tree);
+            const name = offsets_mod.identifierTokenToNameSlice(tree, name_token);
             const node = decl.ast_node;
             const loc = offsets_mod.nodeToLoc(tree, node);
             const pos = offsets_mod.indexToPosition(buffer[0..stat.size], loc.start, .@"utf-8");
-            // VSCode and most terminals expect 1-based line/column
-            try std.io.getStdOut().writer().print("{s}:{d}:{d}: {s}: {any}\n", .{ file_path, pos.line + 1, pos.character + 1, name, decl });
-        } else {
-            // fallback for non-ast_node declarations
-            try std.io.getStdOut().writer().print("{s}:?:?: {s}: {any}\n", .{ file_path, name, decl });
+            try symbols.append(.{ .name = name, .line = pos.line + 1, .column = pos.character + 1 });
         }
     }
+    return FileSymbols{
+        .file_path = file_path,
+        .symbols = symbols,
+    };
 }
 
 pub fn main() !u8 {
     var gpa = std.heap.page_allocator;
+    const args = try std.process.argsAlloc(gpa);
+    defer std.process.argsFree(gpa, args);
+    // if (args.len < 3) {
+    //     std.debug.print("Usage: {s} <relative_path> <symbol_name>\n", .{args[0]});
+    //     return 1;
+    // }
+    // const search_path = args[1];
+    const symbol_name = args[2];
+
     var files = std.ArrayList([]const u8).init(gpa);
     defer {
         for (files.items) |file| gpa.free(file);
         files.deinit();
     }
     try collectZigFiles(gpa, ".", &files);
+
+    var file_symbols = std.ArrayList(FileSymbols).init(gpa);
+    defer {
+        for (file_symbols.items) |fs| fs.symbols.deinit();
+        file_symbols.deinit();
+    }
     for (files.items) |file| {
-        try std.io.getStdOut().writer().print("{s}\n", .{file});
-        printTopLevelSymbols(gpa, file) catch |err| {
-            std.debug.print("  [error: {}]\n", .{err});
+        const fs = topLevelSymbols(gpa, file) catch |err| {
+            std.debug.print("[error: {}] {s}\n", .{ err, file });
+            continue;
         };
+        try file_symbols.append(fs);
+    }
+
+    for (file_symbols.items) |fs| {
+        for (fs.symbols.items) |sym| {
+            if (std.mem.eql(u8, sym.name, symbol_name)) {
+                std.io.getStdOut().writer().print("{s}:{d}:{d} --- {s}\n", .{ fs.file_path, sym.line, sym.column, sym.name }) catch {};
+            }
+        }
     }
     return 0;
 }
