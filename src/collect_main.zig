@@ -77,11 +77,11 @@ pub fn main() !u8 {
     var gpa = std.heap.page_allocator;
     const args = try std.process.argsAlloc(gpa);
     defer std.process.argsFree(gpa, args);
-    // if (args.len < 3) {
-    //     std.debug.print("Usage: {s} <relative_path> <symbol_name>\n", .{args[0]});
-    //     return 1;
-    // }
-    // const search_path = args[1];
+    if (args.len < 3) {
+        std.debug.print("Usage: {s} <relative_path> <symbol_name>\n", .{args[0]});
+        return 1;
+    }
+    const current_path = args[1];
     const symbol_name = args[2];
 
     var files = std.ArrayList([]const u8).init(gpa);
@@ -107,7 +107,10 @@ pub fn main() !u8 {
     for (file_symbols.items) |fs| {
         for (fs.symbols.items) |sym| {
             if (std.mem.eql(u8, sym.name, symbol_name)) {
-                std.io.getStdOut().writer().print("{s}:{d}:{d} --- {s}\n", .{ fs.file_path, sym.line, sym.column, sym.name }) catch {};
+                const relative_path = try std.fs.path.relative(gpa, current_path, fs.file_path);
+                defer gpa.free(relative_path);
+
+                std.io.getStdOut().writer().print("{s}:{d}:{d} --- {s}\n", .{ relative_path, sym.line, sym.column, sym.name }) catch {};
             }
         }
     }
