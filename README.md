@@ -1,3 +1,7 @@
+# ⚠️ Work in Progress ⚠️
+
+This project is currently a work in progress. For a stable and fully-featured Zig Language Server, please use the official [ZLS LSP](https://github.com/zigtools/zls) instead of this one.
+
 <img src="https://raw.githubusercontent.com/zigtools/zls/master/.github/assets/zls-opt.svg" alt="ZLS Logo" width=200>
 
 [![CI](https://github.com/zigtools/zls/workflows/CI/badge.svg)](https://github.com/zigtools/zls/actions)
