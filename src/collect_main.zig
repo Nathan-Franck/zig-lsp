@@ -33,6 +33,14 @@ const SymbolInfo = struct {
     column: usize,
 };
 
+const MatchingSymbol = struct {
+    name: []const u8,
+    line: usize,
+    column: usize,
+    relative_path: []const u8,
+    depth: usize,
+};
+
 const FileSymbols = struct {
     file_path: []const u8,
     symbols: std.ArrayList(SymbolInfo),
@@ -104,15 +112,39 @@ pub fn main() !u8 {
         try file_symbols.append(fs);
     }
 
+    var matching_symbols = std.ArrayList(MatchingSymbol).init(gpa);
+    defer matching_symbols.deinit();
+
     for (file_symbols.items) |fs| {
         for (fs.symbols.items) |sym| {
             if (std.mem.eql(u8, sym.name, symbol_name)) {
                 const relative_path = try std.fs.path.relative(gpa, current_path, fs.file_path);
-                defer gpa.free(relative_path);
 
-                std.io.getStdOut().writer().print("{s}:{d}:{d} --- {s}\n", .{ relative_path, sym.line, sym.column, sym.name }) catch {};
+                var depth: usize = 0;
+                for (relative_path) |c| {
+                    if (c == std.fs.path.sep) depth += 1;
+                }
+
+                try matching_symbols.append(.{
+                    .name = sym.name,
+                    .line = sym.line,
+                    .column = sym.column,
+                    .relative_path = relative_path,
+                    .depth = depth,
+                });
             }
         }
+    }
+
+    std.mem.sort(MatchingSymbol, matching_symbols.items, {}, struct {
+        fn lessThan(_: void, a: MatchingSymbol, b: MatchingSymbol) bool {
+            return a.depth < b.depth;
+        }
+    }.lessThan);
+
+    for (matching_symbols.items) |sym| {
+        std.io.getStdOut().writer().print("{s}:{d}:{d} --- {s}\n", .{ sym.relative_path, sym.line, sym.column, sym.name }) catch {};
+        gpa.free(sym.relative_path);
     }
     return 0;
 }
