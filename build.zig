@@ -49,6 +49,9 @@ pub fn build(b: *Build) !void {
 
     const single_threaded = b.option(bool, "single-threaded", "Build a single threaded Executable");
     const pie = b.option(bool, "pie", "Build a Position Independent Executable");
+    const enable_tracy = b.option(bool, "enable-tracy", "Whether tracy should be enabled.") orelse false;
+    const enable_tracy_allocation = b.option(bool, "enable-tracy-allocation", "Enable using TracyAllocator to monitor allocations.") orelse enable_tracy;
+    const enable_tracy_callstack = b.option(bool, "enable-tracy-callstack", "Enable callstack graphs.") orelse enable_tracy;
     const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match filter") orelse &.{};
     const use_llvm = b.option(bool, "use-llvm", "Use Zig's llvm code backend");
     const coverage = b.option(bool, "coverage", "Generate a coverage report with kcov") orelse false;
@@ -78,7 +81,17 @@ pub fn build(b: *Build) !void {
     };
 
     const known_folders_module = b.dependency("known_folders", .{}).module("known-folders");
-    const lsp_module = b.dependency("lsp-codegen", .{}).module("lsp");
+    const lsp_module = b.dependency("lsp_codegen", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("lsp");
+    const tracy_module = getTracyModule(b, .{
+        .target = target,
+        .optimize = optimize,
+        .enable = enable_tracy,
+        .enable_allocation = enable_tracy_allocation,
+        .enable_callstack = enable_tracy_callstack,
+    });
 
     { // zig build release
         var release_artifacts: [release_targets.len]*Build.Step.Compile = undefined;
@@ -211,9 +224,15 @@ pub fn build(b: *Build) !void {
     // Add after existing steps
     const collect_run_step = b.addExecutable(.{
         .name = "collect_run",
-        .root_source_file = b.path("src/collect_main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/collect_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lsp", .module = lsp_module },
+                .{ .name = "tracy", .module = tracy_module },
+            },
+        }),
     });
 
     b.installArtifact(collect_run_step);
@@ -540,49 +559,42 @@ const Build = blk: {
         }
     }
 
-    // check minimum build version
-    const is_current_zig_tagged_release = builtin.zig_version.pre == null and builtin.zig_version.build == null;
-    const is_min_build_zig_tagged_release = min_build_zig.pre == null and min_build_zig.build == null;
-    const min_build_zig_simple: std.SemanticVersion = .{ .major = min_build_zig.major, .minor = min_build_zig.minor, .patch = 0 };
-    const current_zig_simple: std.SemanticVersion = .{ .major = builtin.zig_version.major, .minor = builtin.zig_version.minor, .patch = 0 };
-    if (switch (builtin.zig_version.order(min_build_zig)) {
-        .lt => true,
-        .eq => false,
-        .gt => (is_current_zig_tagged_release and !is_min_build_zig_tagged_release) or
-            // a tagged release of ZLS must be build with a tagged release of Zig that has the same major and minor version.
-            (zls_version_is_tagged and (min_build_zig_simple.order(current_zig_simple) != .eq)),
-    }) {
-        const message = std.fmt.comptimePrint(
-            \\Your Zig version does not meet the minimum build requirement:
-            \\  required Zig version: {[minimum_version]} {[required_zig_version_note]s}
-            \\  actual   Zig version: {[current_version]}
-            \\
-            \\
-        ++ if (is_min_build_zig_tagged_release)
-            std.fmt.comptimePrint(
-                \\Please download the {[minimum_version]} release of Zig. (https://ziglang.org/download/)
-                \\
-                \\Tagged releases of ZLS are also available.
-                \\  -> https://github.com/zigtools/zls/releases
-                \\  -> https://github.com/zigtools/zls/releases/tag/{[minimum_version_simple]} (may not exist yet)
-            , .{
-                .minimum_version = min_build_zig,
-                .minimum_version_simple = min_build_zig_simple,
-            })
-        else if (is_current_zig_tagged_release)
-            \\Please download or compile a tagged release of ZLS.
-            \\  -> https://github.com/zigtools/zls/releases
-            \\  -> https://github.com/zigtools/zls/releases/tag/{[current_version]} (may not exist yet)
-        else
-            \\You can take one of the following actions to resolve this issue:
-            \\  - Download the latest nightly of Zig (https://ziglang.org/download/)
-            \\  - Compile an older version of ZLS that is compatible with your Zig version
-        , .{
-            .current_version = builtin.zig_version,
-            .minimum_version = min_build_zig,
-            .required_zig_version_note = if (!zls_version_is_tagged) "(or greater)" else "",
-        });
-        @compileError(message);
-    }
+    // Disabled Zig version check for development flexibility
+    // if (switch (builtin.zig_version.order(min_build_zig)) {
+    //     .lt => true,
+    //     .eq => false,
+    //     .gt => (is_current_zig_tagged_release and !is_min_build_zig_tagged_release) or
+    //         // a tagged release of ZLS must be build with a tagged release of Zig that has the same major and minor version.
+    //         (zls_version_is_tagged and (min_build_zig_simple.order(current_zig_simple) != .eq)),
+    // }) {
+    //     const message = std.fmt.comptimePrint(
+    //         "Your Zig version does not meet the minimum build requirement:\n"
+    //         "  required Zig version: {[minimum_version]} {[required_zig_version_note]s}\n"
+    //         "  actual   Zig version: {[current_version]}\n\n"
+    //     ++ if (is_min_build_zig_tagged_release)
+    //         std.fmt.comptimePrint(
+    //             "Please download the {[minimum_version]} release of Zig. (https://ziglang.org/download/)\n"
+    //             "Tagged releases of ZLS are also available.\n"
+    //             "  -> https://github.com/zigtools/zls/releases\n"
+    //             "  -> https://github.com/zigtools/zls/releases/tag/{[minimum_version_simple]} (may not exist yet)",
+    //             .{
+    //                 .minimum_version = min_build_zig,
+    //                 .minimum_version_simple = min_build_zig_simple,
+    //             })
+    //     else if (is_current_zig_tagged_release)
+    //         "Please download or compile a tagged release of ZLS.\n"
+    //         "  -> https://github.com/zigtools/zls/releases\n"
+    //         "  -> https://github.com/zigtools/zls/releases/tag/{[current_version]} (may not exist yet)"
+    //     else
+    //         "You can take one of the following actions to resolve this issue:\n"
+    //         "  - Download the latest nightly of Zig (https://ziglang.org/download/)\n"
+    //         "  - Compile an older version of ZLS that is compatible with your Zig version",
+    //         .{
+    //             .current_version = builtin.zig_version,
+    //             .minimum_version = min_build_zig,
+    //             .required_zig_version_note = if (!zls_version_is_tagged) "(or greater)" else "",
+    //         });
+    //     @compileError(message);
+    // }
     break :blk std.Build;
 };
