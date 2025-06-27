@@ -207,6 +207,20 @@ pub fn build(b: *Build) !void {
         });
         test_step.dependOn(&install_coverage.step);
     }
+
+    // Add after existing steps
+    const collect_run_step = b.addExecutable(.{
+        .name = "collect_run",
+        .root_source_file = b.path("src/collect_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    b.installArtifact(collect_run_step);
+
+    const collect_run_cmd = b.addRunArtifact(collect_run_step);
+    collect_run_cmd.step.dependOn(b.getInstallStep());
+    b.step("collect-run", "Run the collect entrypoint").dependOn(&collect_run_cmd.step);
 }
 
 /// Returns `MAJOR.MINOR.PATCH-dev` when `git describe` failed.
