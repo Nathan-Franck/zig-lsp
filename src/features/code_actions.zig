@@ -1251,7 +1251,7 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
         // Skip the current file
         if (std.mem.eql(u8, handle.uri, builder.handle.uri)) continue;
 
-        // Skip non-Zig files
+        // Skip non-zig files
         if (!std.mem.endsWith(u8, handle.uri, ".zig")) continue;
 
         // Get the document scope to find public symbols
@@ -1298,12 +1298,10 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
                 const node = decl.ast_node;
                 const main_token = node_tokens[node];
 
-                // Check if the declaration is marked with 'pub'
                 const is_pub = if (main_token > 0)
                     token_tags[main_token - 1] == .keyword_pub
                 else
                     false;
-
                 if (!is_pub) continue;
 
                 const name_token = decl.nameToken(handle.tree);
@@ -1348,6 +1346,7 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
         const title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, sym.relative_path });
         for (builder.actions.items) |action| {
             if (std.mem.eql(u8, action.title, title)) {
+                log.info("Skipping redundant {s}\n", .{title});
                 continue;
             }
         }
