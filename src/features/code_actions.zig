@@ -1227,13 +1227,6 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
 
     const identifier_name = offsets.locToSlice(builder.handle.tree.source, loc);
 
-    // Check if we've already added this code action
-    for (builder.actions.items) |action| {
-        if (std.mem.eql(u8, action.title, "Add missing imports (placeholder)")) {
-            return; // Already added, don't add again
-        }
-    }
-
     // Get current file path from URI
     const current_file_path = URI.parse(builder.arena, builder.handle.uri) catch |err| {
         log.debug("Failed to parse URI: {}", .{err});
@@ -1352,20 +1345,14 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
 
         const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
         const edit = builder.createTextEditLoc(insert_loc, import_stmt);
+        const title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, sym.relative_path });
+        for (builder.actions.items) |action| {
+            if (std.mem.eql(u8, action.title, title)) {
+                continue;
+            }
+        }
         try builder.actions.append(builder.arena, .{
-            .title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, sym.relative_path }),
-            .kind = .quickfix,
-            .isPreferred = false,
-            .edit = try builder.createWorkspaceEdit(&.{edit}),
-        });
-    }
-
-    // If no matches found, add a placeholder action
-    if (matching_symbols.items.len == 0) {
-        const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
-        const edit = builder.createTextEditLoc(insert_loc, "// TODO: add missing imports\n");
-        try builder.actions.append(builder.arena, .{
-            .title = "Add missing imports (placeholder)",
+            .title = title,
             .kind = .quickfix,
             .isPreferred = false,
             .edit = try builder.createWorkspaceEdit(&.{edit}),
