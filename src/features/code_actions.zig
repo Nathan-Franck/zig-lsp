@@ -1247,6 +1247,7 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
         name: []const u8,
         relative_path: []const u8,
         depth: usize,
+        is_file_match: bool, // true if the file itself matches the identifier name
     };
     var matching_symbols = std.ArrayList(MatchingSymbol).init(builder.arena);
     defer matching_symbols.deinit();
@@ -1266,6 +1267,34 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
             continue;
         };
 
+        const target_file_path = URI.parse(builder.arena, handle.uri) catch |err| {
+            log.debug("Failed to parse target URI: {}", .{err});
+            continue;
+        };
+        defer builder.arena.free(target_file_path);
+
+        const relative_path = std.fs.path.relative(builder.arena, current_dir, target_file_path) catch |err| {
+            log.debug("Failed to get relative path: {}", .{err});
+            continue;
+        };
+
+        var depth: usize = 0;
+        for (relative_path) |c| {
+            if (c == std.fs.path.sep) depth += 1;
+        }
+
+        // Check if the file itself matches the identifier name (file as struct)
+        const file_name_without_ext = std.fs.path.stem(target_file_path);
+        if (std.mem.eql(u8, file_name_without_ext, identifier_name)) {
+            try matching_symbols.append(.{
+                .name = identifier_name,
+                .relative_path = relative_path,
+                .depth = depth,
+                .is_file_match = true,
+            });
+        }
+
+        // Check for symbols inside the file
         const root_scope = DocumentScope.Scope.Index.root;
         const token_tags = handle.tree.tokens.items(.tag);
         const node_tokens = handle.tree.nodes.items(.main_token);
@@ -1288,35 +1317,25 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
                 const name = offsets.identifierTokenToNameSlice(handle.tree, name_token);
 
                 if (std.mem.eql(u8, name, identifier_name)) {
-                    const target_file_path = URI.parse(builder.arena, handle.uri) catch |err| {
-                        log.debug("Failed to parse target URI: {}", .{err});
-                        continue;
-                    };
-                    defer builder.arena.free(target_file_path);
-
-                    const relative_path = std.fs.path.relative(builder.arena, current_dir, target_file_path) catch |err| {
-                        log.debug("Failed to get relative path: {}", .{err});
-                        continue;
-                    };
-
-                    var depth: usize = 0;
-                    for (relative_path) |c| {
-                        if (c == std.fs.path.sep) depth += 1;
-                    }
-
                     try matching_symbols.append(.{
                         .name = name,
                         .relative_path = relative_path,
                         .depth = depth,
+                        .is_file_match = false,
                     });
                 }
             }
         }
     }
 
-    // Sort by depth (closest files first)
+    // Sort by file match first (higher priority), then by depth (closest files first)
     std.mem.sort(MatchingSymbol, matching_symbols.items, {}, struct {
         fn lessThan(_: void, a: MatchingSymbol, b: MatchingSymbol) bool {
+            // File matches get higher priority
+            if (a.is_file_match != b.is_file_match) {
+                return a.is_file_match;
+            }
+            // Then sort by depth (closest files first)
             return a.depth < b.depth;
         }
     }.lessThan);
@@ -1326,7 +1345,11 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
         // Skip if it's the same file
         if (std.mem.eql(u8, sym.relative_path, std.fs.path.basename(current_file_path))) continue;
 
-        const import_stmt = try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\").{s};\n", .{ identifier_name, sym.relative_path, identifier_name });
+        const import_stmt = if (sym.is_file_match)
+            try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\");\n", .{ identifier_name, sym.relative_path })
+        else
+            try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\").{s};\n", .{ identifier_name, sym.relative_path, identifier_name });
+
         const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
         const edit = builder.createTextEditLoc(insert_loc, import_stmt);
         try builder.actions.append(builder.arena, .{
