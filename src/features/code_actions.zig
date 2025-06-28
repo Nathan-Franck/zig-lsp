@@ -14,14 +14,6 @@ const tracy = @import("tracy");
 const log = std.log.scoped(.code_actions);
 const URI = @import("../uri.zig");
 
-const MatchingSymbol = struct {
-    name: []const u8,
-    line: usize,
-    column: usize,
-    relative_path: []const u8,
-    depth: usize,
-};
-
 pub const Builder = struct {
     arena: std.mem.Allocator,
     analyser: *Analyser,
@@ -1251,6 +1243,11 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
     const current_dir = std.fs.path.dirname(current_file_path) orelse ".";
 
     // Find matching symbols from existing DocumentStore handles
+    const MatchingSymbol = struct {
+        name: []const u8,
+        relative_path: []const u8,
+        depth: usize,
+    };
     var matching_symbols = std.ArrayList(MatchingSymbol).init(builder.arena);
     defer matching_symbols.deinit();
 
@@ -1309,8 +1306,6 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
 
                     try matching_symbols.append(.{
                         .name = name,
-                        .line = 0, // We don't need exact line/column for import suggestions
-                        .column = 0,
                         .relative_path = relative_path,
                         .depth = depth,
                     });
