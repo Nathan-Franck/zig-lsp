@@ -76,12 +76,25 @@ fn topLevelSymbols(
 
     var symbols = std.ArrayList(SymbolInfo).init(allocator);
     const root_scope = DocumentScope.Scope.Index.root;
+    const token_tags = tree.tokens.items(.tag);
+    const node_tokens = tree.nodes.items(.main_token);
+
     for (doc_scope.getScopeDeclarationsConst(root_scope)) |decl_index| {
         const decl = doc_scope.declarations.get(@intFromEnum(decl_index));
         if (decl == .ast_node) {
+            const node = decl.ast_node;
+            const main_token = node_tokens[node];
+
+            // Check if the declaration is marked with 'pub'
+            const is_pub = if (main_token > 0)
+                token_tags[main_token - 1] == .keyword_pub
+            else
+                false;
+
+            if (!is_pub) continue;
+
             const name_token = decl.nameToken(tree);
             const name = offsets.identifierTokenToNameSlice(tree, name_token);
-            const node = decl.ast_node;
             const loc = offsets.nodeToLoc(tree, node);
             const pos = offsets.indexToPosition(buffer[0..stat.size], loc.start, .@"utf-8");
             try symbols.append(.{ .name = name, .line = pos.line + 1, .column = pos.character + 1 });
@@ -1406,17 +1419,11 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
         // Skip if it's the same file
         if (std.mem.eql(u8, sym.relative_path, std.fs.path.basename(current_file_path))) continue;
 
-        // Convert relative path to import path (remove .zig extension)
-        const import_path = if (std.mem.endsWith(u8, sym.relative_path, ".zig"))
-            sym.relative_path[0 .. sym.relative_path.len - 4]
-        else
-            sym.relative_path;
-
-        const import_stmt = try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\");\n", .{ identifier_name, import_path });
+        const import_stmt = try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\").{s};\n", .{ identifier_name, sym.relative_path, identifier_name });
         const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
         const edit = builder.createTextEditLoc(insert_loc, import_stmt);
         try builder.actions.append(builder.arena, .{
-            .title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, import_path }),
+            .title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, sym.relative_path }),
             .kind = .quickfix,
             .isPreferred = false,
             .edit = try builder.createWorkspaceEdit(&.{edit}),
