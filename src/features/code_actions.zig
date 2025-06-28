@@ -22,90 +22,6 @@ const MatchingSymbol = struct {
     depth: usize,
 };
 
-const SymbolInfo = struct {
-    name: []const u8,
-    line: usize,
-    column: usize,
-};
-
-const FileSymbols = struct {
-    file_path: []const u8,
-    symbols: std.ArrayList(SymbolInfo),
-};
-
-// Function to collect all Zig files in the workspace
-fn collectZigFiles(
-    allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    files: *std.ArrayList([]const u8),
-) !void {
-    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        if (entry.kind == .directory) {
-            if (std.mem.eql(u8, entry.name, ".zig-cache")) continue;
-            const sub_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
-            defer allocator.free(sub_path);
-            try collectZigFiles(allocator, sub_path, files);
-        } else if (entry.kind == .file) {
-            if (std.mem.endsWith(u8, entry.name, ".zig")) {
-                const file_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
-                try files.append(file_path);
-            }
-        }
-    }
-}
-
-// Function to extract top-level symbols from a file
-fn topLevelSymbols(
-    allocator: std.mem.Allocator,
-    file_path: []const u8,
-) !FileSymbols {
-    var file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
-    const stat = try file.stat();
-    const buffer = try allocator.alloc(u8, stat.size + 1);
-    _ = try file.readAll(buffer[0..stat.size]);
-    buffer[stat.size] = 0; // null-terminate
-    var tree = try Ast.parse(allocator, buffer[0..stat.size :0], .zig);
-    defer tree.deinit(allocator);
-
-    var doc_scope = try DocumentScope.init(allocator, tree);
-    defer doc_scope.deinit(allocator);
-
-    var symbols = std.ArrayList(SymbolInfo).init(allocator);
-    const root_scope = DocumentScope.Scope.Index.root;
-    const token_tags = tree.tokens.items(.tag);
-    const node_tokens = tree.nodes.items(.main_token);
-
-    for (doc_scope.getScopeDeclarationsConst(root_scope)) |decl_index| {
-        const decl = doc_scope.declarations.get(@intFromEnum(decl_index));
-        if (decl == .ast_node) {
-            const node = decl.ast_node;
-            const main_token = node_tokens[node];
-
-            // Check if the declaration is marked with 'pub'
-            const is_pub = if (main_token > 0)
-                token_tags[main_token - 1] == .keyword_pub
-            else
-                false;
-
-            if (!is_pub) continue;
-
-            const name_token = decl.nameToken(tree);
-            const name = offsets.identifierTokenToNameSlice(tree, name_token);
-            const loc = offsets.nodeToLoc(tree, node);
-            const pos = offsets.indexToPosition(buffer[0..stat.size], loc.start, .@"utf-8");
-            try symbols.append(.{ .name = name, .line = pos.line + 1, .column = pos.character + 1 });
-        }
-    }
-    return FileSymbols{
-        .file_path = file_path,
-        .symbols = symbols,
-    };
-}
-
 pub const Builder = struct {
     arena: std.mem.Allocator,
     analyser: *Analyser,
@@ -228,26 +144,6 @@ pub const Builder = struct {
         try workspace_edit.changes.?.map.putNoClobber(self.arena, self.handle.uri, try self.arena.dupe(types.TextEdit, edits));
 
         return workspace_edit;
-    }
-
-    /// Converts a file URI to a relative import path for the current file
-    pub fn getImportPathFromUri(self: *Builder, file_uri: []const u8) error{ OutOfMemory, UnexpectedCharacter, InvalidFormat, InvalidPort }![]const u8 {
-        const current_file_path = try URI.parse(self.arena, self.handle.uri);
-        defer self.arena.free(current_file_path);
-        const target_file_path = try URI.parse(self.arena, file_uri);
-        defer self.arena.free(target_file_path);
-
-        const current_dir = std.fs.path.dirname(current_file_path).?;
-        const target_file_name = std.fs.path.basename(target_file_path);
-
-        // If files are in the same directory, just use the filename
-        if (std.mem.eql(u8, current_dir, std.fs.path.dirname(target_file_path).?)) {
-            return try self.arena.dupe(u8, target_file_name);
-        }
-
-        // For now, just return the filename as a simple approach
-        // TODO: Implement proper relative path calculation
-        return try self.arena.dupe(u8, target_file_name);
     }
 };
 
@@ -1354,55 +1250,71 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
     defer builder.arena.free(current_file_path);
     const current_dir = std.fs.path.dirname(current_file_path) orelse ".";
 
-    // Collect all Zig files in the workspace
-    var files = std.ArrayList([]const u8).init(builder.arena);
-    defer {
-        for (files.items) |file| builder.arena.free(file);
-        files.deinit();
-    }
-    collectZigFiles(builder.arena, ".", &files) catch |err| {
-        log.debug("Failed to collect Zig files: {}", .{err});
-        return;
-    };
-
-    // Extract symbols from all files
-    var file_symbols = std.ArrayList(FileSymbols).init(builder.arena);
-    defer {
-        for (file_symbols.items) |fs| fs.symbols.deinit();
-        file_symbols.deinit();
-    }
-    for (files.items) |file| {
-        const fs = topLevelSymbols(builder.arena, file) catch |err| {
-            log.debug("[error: {}] {s}", .{ err, file });
-            continue;
-        };
-        try file_symbols.append(fs);
-    }
-
-    // Find matching symbols
+    // Find matching symbols from existing DocumentStore handles
     var matching_symbols = std.ArrayList(MatchingSymbol).init(builder.arena);
     defer matching_symbols.deinit();
 
-    for (file_symbols.items) |fs| {
-        for (fs.symbols.items) |sym| {
-            if (std.mem.eql(u8, sym.name, identifier_name)) {
-                const relative_path = std.fs.path.relative(builder.arena, current_dir, fs.file_path) catch |err| {
-                    log.debug("Failed to get relative path: {}", .{err});
-                    continue;
-                };
+    // Iterate through all handles in the DocumentStore
+    const handles = builder.analyser.store.handles.values();
+    for (handles) |handle| {
+        // Skip the current file
+        if (std.mem.eql(u8, handle.uri, builder.handle.uri)) continue;
 
-                var depth: usize = 0;
-                for (relative_path) |c| {
-                    if (c == std.fs.path.sep) depth += 1;
+        // Skip non-Zig files
+        if (!std.mem.endsWith(u8, handle.uri, ".zig")) continue;
+
+        // Get the document scope to find public symbols
+        const doc_scope = handle.getDocumentScope() catch |err| {
+            log.debug("Failed to get document scope for {s}: {}", .{ handle.uri, err });
+            continue;
+        };
+
+        const root_scope = DocumentScope.Scope.Index.root;
+        const token_tags = handle.tree.tokens.items(.tag);
+        const node_tokens = handle.tree.nodes.items(.main_token);
+
+        for (doc_scope.getScopeDeclarationsConst(root_scope)) |decl_index| {
+            const decl = doc_scope.declarations.get(@intFromEnum(decl_index));
+            if (decl == .ast_node) {
+                const node = decl.ast_node;
+                const main_token = node_tokens[node];
+
+                // Check if the declaration is marked with 'pub'
+                const is_pub = if (main_token > 0)
+                    token_tags[main_token - 1] == .keyword_pub
+                else
+                    false;
+
+                if (!is_pub) continue;
+
+                const name_token = decl.nameToken(handle.tree);
+                const name = offsets.identifierTokenToNameSlice(handle.tree, name_token);
+
+                if (std.mem.eql(u8, name, identifier_name)) {
+                    const target_file_path = URI.parse(builder.arena, handle.uri) catch |err| {
+                        log.debug("Failed to parse target URI: {}", .{err});
+                        continue;
+                    };
+                    defer builder.arena.free(target_file_path);
+
+                    const relative_path = std.fs.path.relative(builder.arena, current_dir, target_file_path) catch |err| {
+                        log.debug("Failed to get relative path: {}", .{err});
+                        continue;
+                    };
+
+                    var depth: usize = 0;
+                    for (relative_path) |c| {
+                        if (c == std.fs.path.sep) depth += 1;
+                    }
+
+                    try matching_symbols.append(.{
+                        .name = name,
+                        .line = 0, // We don't need exact line/column for import suggestions
+                        .column = 0,
+                        .relative_path = relative_path,
+                        .depth = depth,
+                    });
                 }
-
-                try matching_symbols.append(.{
-                    .name = sym.name,
-                    .line = sym.line,
-                    .column = sym.column,
-                    .relative_path = relative_path,
-                    .depth = depth,
-                });
             }
         }
     }
