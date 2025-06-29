@@ -1219,17 +1219,44 @@ test getCaptureLoc {
     try std.testing.expect(getCaptureLoc("|    |", .{ .start = 1, .end = 6 }) == null);
 }
 
-fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
+fn collectLocalFiles(
+    builder: *Builder,
+    dir_path: []const u8,
+) !void {
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind == .directory) {
+            if (std.mem.eql(u8, entry.name, ".zig-cache")) continue;
+            const sub_path = try std.fs.path.join(builder.arena, &[_][]const u8{ dir_path, entry.name });
+            defer builder.arena.free(sub_path);
+            try collectLocalFiles(builder, sub_path);
+        } else if (entry.kind == .file) {
+            if (std.mem.endsWith(u8, entry.name, ".zig")) {
+                const rel_file_path = try std.fs.path.join(builder.arena, &[_][]const u8{ dir_path, entry.name });
+                const file_path = try std.fs.cwd().realpathAlloc(builder.arena, rel_file_path);
+                _ = builder.analyser.store.getOrLoadHandle(try URI.fromPath(builder.arena, file_path));
+            }
+        }
+    }
+}
+
+fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) error{OutOfMemory}!void {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
     if (!builder.wantKind(.quickfix)) return;
 
+    collectLocalFiles(builder, ".") catch {
+        log.err("Couldn't collect local files\n", .{});
+    };
+
     const identifier_name = offsets.locToSlice(builder.handle.tree.source, loc);
 
     // Get current file path from URI
-    const current_file_path = URI.parse(builder.arena, builder.handle.uri) catch |err| {
-        log.debug("Failed to parse URI: {}", .{err});
+    const current_file_path = URI.parse(builder.arena, builder.handle.uri) catch {
+        log.err("Couldn't parse uri\n", .{});
         return;
     };
     defer builder.arena.free(current_file_path);
@@ -1245,6 +1272,32 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
     var matching_symbols = std.ArrayList(MatchingSymbol).init(builder.arena);
     defer matching_symbols.deinit();
 
+    // Try to get the associated build file
+    const build_file_uri = try builder.handle.getAssociatedBuildFileUri(builder.analyser.store) orelse return;
+    const build_file = builder.analyser.store.getBuildFile(build_file_uri) orelse return;
+    const build_config = build_file.tryLockConfig() orelse return;
+    defer build_file.unlockConfig();
+
+    if (std.mem.eql(u8, "std", identifier_name)) {
+        try matching_symbols.append(.{
+            .name = "std",
+            .relative_path = "std",
+            .depth = 0,
+            .is_file_match = true,
+        });
+    }
+
+    for (build_config.packages) |pkg| {
+        if (std.mem.eql(u8, pkg.name, identifier_name)) {
+            try matching_symbols.append(.{
+                .name = pkg.name,
+                .relative_path = pkg.name,
+                .depth = 0,
+                .is_file_match = true,
+            });
+        }
+    }
+
     // Iterate through all handles in the DocumentStore
     const handles = builder.analyser.store.handles.values();
     for (handles) |handle| {
@@ -1255,22 +1308,17 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) !void {
         if (!std.mem.endsWith(u8, handle.uri, ".zig")) continue;
 
         // Get the document scope to find public symbols
-        const doc_scope = handle.getDocumentScope() catch |err| {
-            log.debug("Failed to get document scope for {s}: {}", .{ handle.uri, err });
-            continue;
+        const doc_scope = try handle.getDocumentScope();
+
+        const target_file_path = URI.parse(builder.arena, handle.uri) catch {
+            log.err("Couldn't parse uri\n", .{});
+            return;
         };
 
-        const target_file_path = URI.parse(builder.arena, handle.uri) catch |err| {
-            log.debug("Failed to parse target URI: {}", .{err});
-            continue;
+        const relative_path = std.fs.path.relative(builder.arena, current_dir, target_file_path) catch {
+            log.err("Couldn't build relative path\n", .{});
+            return;
         };
-        defer builder.arena.free(target_file_path);
-
-        const relative_path = std.fs.path.relative(builder.arena, current_dir, target_file_path) catch |err| {
-            log.debug("Failed to get relative path: {}", .{err});
-            continue;
-        };
-
         var depth: usize = 0;
         for (relative_path) |c| {
             if (c == std.fs.path.sep) depth += 1;
