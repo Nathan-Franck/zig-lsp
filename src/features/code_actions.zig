@@ -65,7 +65,8 @@ pub const Builder = struct {
                 // the undeclared identifier may be a discard
                 .undeclared_identifier => {
                     try handlePointlessDiscard(builder, loc);
-                    try handleMissingSymbolImports(builder, loc);
+                    if (try MissingSymbolImports.init(builder, loc)) |missing_symbol_imports|
+                        try missing_symbol_imports.handleIt();
                 },
                 .unreachable_code => {
                     // TODO
@@ -1219,105 +1220,168 @@ test getCaptureLoc {
     try std.testing.expect(getCaptureLoc("|    |", .{ .start = 1, .end = 6 }) == null);
 }
 
-fn collectLocalFiles(
+const MissingSymbolImports = struct {
+    const base_path = ".";
+
     builder: *Builder,
-    dir_path: []const u8,
-) !void {
-    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        if (entry.kind == .directory) {
-            if (std.mem.eql(u8, entry.name, ".zig-cache")) continue;
-            const sub_path = try std.fs.path.join(builder.arena, &[_][]const u8{ dir_path, entry.name });
-            defer builder.arena.free(sub_path);
-            try collectLocalFiles(builder, sub_path);
-        } else if (entry.kind == .file) {
-            if (std.mem.endsWith(u8, entry.name, ".zig")) {
-                const rel_file_path = try std.fs.path.join(builder.arena, &[_][]const u8{ dir_path, entry.name });
-                const file_path = try std.fs.cwd().realpathAlloc(builder.arena, rel_file_path);
-                _ = builder.analyser.store.getOrLoadHandle(try URI.fromPath(builder.arena, file_path));
-            }
-        }
-    }
-}
+    identifier_name: []const u8,
+    current_dir: []const u8,
+    current_file_path: []const u8,
+    matching_symbols: *std.ArrayList(MatchingSymbol),
 
-fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) error{OutOfMemory}!void {
-    const tracy_zone = tracy.trace(@src());
-    defer tracy_zone.end();
-
-    if (!builder.wantKind(.quickfix)) return;
-
-    collectLocalFiles(builder, ".") catch {
-        log.err("Couldn't collect local files\n", .{});
-    };
-
-    const identifier_name = offsets.locToSlice(builder.handle.tree.source, loc);
-
-    // Get current file path from URI
-    const current_file_path = URI.parse(builder.arena, builder.handle.uri) catch {
-        log.err("Couldn't parse uri\n", .{});
-        return;
-    };
-    defer builder.arena.free(current_file_path);
-    const current_dir = std.fs.path.dirname(current_file_path) orelse ".";
-
-    // Find matching symbols from existing DocumentStore handles
     const MatchingSymbol = struct {
         name: []const u8,
         relative_path: []const u8,
         depth: usize,
         is_file_match: bool, // true if the file itself matches the identifier name
     };
-    var matching_symbols = std.ArrayList(MatchingSymbol).init(builder.arena);
-    defer matching_symbols.deinit();
 
-    // Try to get the associated build file
-    const build_file_uri = try builder.handle.getAssociatedBuildFileUri(builder.analyser.store) orelse return;
-    const build_file = builder.analyser.store.getBuildFile(build_file_uri) orelse return;
-    const build_config = build_file.tryLockConfig() orelse return;
-    defer build_file.unlockConfig();
+    fn init(
+        builder: *Builder,
+        loc: offsets.Loc,
+    ) !?@This() {
+        const tracy_zone = tracy.trace(@src());
+        defer tracy_zone.end();
 
-    if (std.mem.eql(u8, "std", identifier_name)) {
-        try matching_symbols.append(.{
-            .name = "std",
-            .relative_path = "std",
-            .depth = 0,
-            .is_file_match = true,
-        });
+        if (!builder.wantKind(.quickfix)) return null;
+
+        const identifier_name = offsets.locToSlice(builder.handle.tree.source, loc);
+        const matching_symbols = try builder.arena.create(std.ArrayList(MatchingSymbol));
+        matching_symbols.* = .init(builder.arena);
+
+        const current_file_path = URI.parse(builder.arena, builder.handle.uri) catch {
+            log.err("Couldn't parse uri\n", .{});
+            return null;
+        };
+        const current_dir = std.fs.path.dirname(current_file_path) orelse ".";
+        return .{
+            .builder = builder,
+            .current_dir = current_dir,
+            .current_file_path = current_file_path,
+            .identifier_name = identifier_name,
+            .matching_symbols = matching_symbols,
+        };
     }
 
-    for (build_config.packages) |pkg| {
-        if (std.mem.eql(u8, pkg.name, identifier_name)) {
-            try matching_symbols.append(.{
-                .name = pkg.name,
-                .relative_path = pkg.name,
-                .depth = 0,
-                .is_file_match = true,
+    fn checkLocalFilesForImports(
+        self: @This(),
+        current_dir: []const u8,
+    ) !void {
+        var dir = try std.fs.cwd().openDir(current_dir, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind == .directory) {
+                if (std.mem.eql(u8, entry.name, ".zig-cache")) continue;
+                const sub_path = try std.fs.path.join(self.builder.arena, &[_][]const u8{ current_dir, entry.name });
+                defer self.builder.arena.free(sub_path);
+                try self.checkLocalFilesForImports(sub_path);
+            } else if (entry.kind == .file) {
+                if (std.mem.endsWith(u8, entry.name, ".zig")) {
+                    const rel_file_path = try std.fs.path.join(self.builder.arena, &[_][]const u8{ current_dir, entry.name });
+                    const file_path = try std.fs.cwd().realpathAlloc(self.builder.arena, rel_file_path);
+                    if (self.builder.analyser.store.getOrLoadHandle(try URI.fromPath(self.builder.arena, file_path))) |handle| {
+                        try self.checkFileForImports(handle, .{ .path = file_path });
+                    }
+                }
+            }
+        }
+    }
+
+    fn handleIt(
+        self: @This(),
+    ) error{OutOfMemory}!void {
+        log.info("hello!!!!\n", .{});
+        const builder = self.builder;
+        const identifier_name = self.identifier_name;
+
+        if (builder.analyser.store.config.zig_lib_path) |std_folder| {
+            const std_path = try std.fs.path.join(builder.arena, &.{ std_folder, "std", "std.zig" });
+            log.info("std: {s}\n", .{std_path});
+            if (builder.analyser.store.getOrLoadHandle(try URI.fromPath(builder.arena, std_path))) |handle| {
+                try self.checkFileForImports(handle, .{ .module = "std" });
+            }
+        }
+
+        {
+            const build_file_uri = try builder.handle.getAssociatedBuildFileUri(builder.analyser.store) orelse return;
+            const build_file = builder.analyser.store.getBuildFile(build_file_uri) orelse return;
+            const build_config = build_file.tryLockConfig() orelse return;
+            build_file.unlockConfig();
+
+            for (build_config.packages) |pkg| {
+                log.info("pkg: {s} {s}\n", .{ pkg.name, pkg.path });
+                if (builder.analyser.store.getOrLoadHandle(try URI.fromPath(builder.arena, pkg.path))) |handle| {
+                    try self.checkFileForImports(handle, .{ .module = pkg.name });
+                }
+            }
+        }
+
+        self.checkLocalFilesForImports(base_path) catch {
+            log.err("Couldn't check local files\n", .{});
+        };
+
+        // Sort by file match first (higher priority), then by depth (closest files first)
+        std.mem.sort(MatchingSymbol, self.matching_symbols.items, {}, struct {
+            fn lessThan(_: void, a: MatchingSymbol, b: MatchingSymbol) bool {
+                // File matches get higher priority
+                if (a.is_file_match != b.is_file_match) {
+                    return a.is_file_match;
+                }
+                // Then sort by depth (closest files first)
+                return a.depth < b.depth;
+            }
+        }.lessThan);
+
+        // Create import suggestions for each matching symbol
+        for (self.matching_symbols.items) |sym| {
+            // Skip if it's the same file
+            if (std.mem.eql(u8, sym.relative_path, std.fs.path.basename(self.current_file_path))) continue;
+
+            const import_stmt = if (sym.is_file_match)
+                try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\");\n", .{ identifier_name, sym.relative_path })
+            else
+                try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\").{s};\n", .{ identifier_name, sym.relative_path, identifier_name });
+
+            const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
+            const edit = builder.createTextEditLoc(insert_loc, import_stmt);
+            const title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, sym.relative_path });
+            for (builder.actions.items) |action| {
+                if (std.mem.eql(u8, action.title, title)) {
+                    continue;
+                }
+            }
+            try builder.actions.append(builder.arena, .{
+                .title = title,
+                .kind = .quickfix,
+                .isPreferred = false,
+                .edit = try builder.createWorkspaceEdit(&.{edit}),
             });
         }
     }
 
-    // Iterate through all handles in the DocumentStore
-    const handles = builder.analyser.store.handles.values();
-    for (handles) |handle| {
+    fn checkFileForImports(
+        self: @This(),
+        handle: *DocumentStore.Handle,
+        target: union(enum) { path: []const u8, module: []const u8 },
+    ) !void {
+        const builder = self.builder;
+
         // Skip the current file
-        if (std.mem.eql(u8, handle.uri, builder.handle.uri)) continue;
+        if (std.mem.eql(u8, handle.uri, builder.handle.uri)) return;
 
         // Skip non-zig files
-        if (!std.mem.endsWith(u8, handle.uri, ".zig")) continue;
+        if (!std.mem.endsWith(u8, handle.uri, ".zig")) return;
 
         // Get the document scope to find public symbols
         const doc_scope = try handle.getDocumentScope();
 
-        const target_file_path = URI.parse(builder.arena, handle.uri) catch {
-            log.err("Couldn't parse uri\n", .{});
-            return;
-        };
-
-        const relative_path = std.fs.path.relative(builder.arena, current_dir, target_file_path) catch {
-            log.err("Couldn't build relative path\n", .{});
-            return;
+        const relative_path = switch (target) {
+            .module => |m| m,
+            .path => |p| std.fs.path.relative(builder.arena, self.current_dir, p) catch {
+                log.err("Couldn't build relative path\n", .{});
+                return;
+            },
         };
         var depth: usize = 0;
         for (relative_path) |c| {
@@ -1325,10 +1389,13 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) error{OutOfMe
         }
 
         // Check if the file itself matches the identifier name (file as struct)
-        const file_name_without_ext = std.fs.path.stem(target_file_path);
-        if (std.mem.eql(u8, file_name_without_ext, identifier_name)) {
-            try matching_symbols.append(.{
-                .name = identifier_name,
+        const file_name_without_ext = switch (target) {
+            .module => |m| m,
+            .path => |p| std.fs.path.stem(p),
+        };
+        if (std.mem.eql(u8, file_name_without_ext, self.identifier_name)) {
+            try self.matching_symbols.append(.{
+                .name = self.identifier_name,
                 .relative_path = relative_path,
                 .depth = depth,
                 .is_file_match = true,
@@ -1355,8 +1422,8 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) error{OutOfMe
                 const name_token = decl.nameToken(handle.tree);
                 const name = offsets.identifierTokenToNameSlice(handle.tree, name_token);
 
-                if (std.mem.eql(u8, name, identifier_name)) {
-                    try matching_symbols.append(.{
+                if (std.mem.eql(u8, name, self.identifier_name)) {
+                    try self.matching_symbols.append(.{
                         .name = name,
                         .relative_path = relative_path,
                         .depth = depth,
@@ -1366,43 +1433,4 @@ fn handleMissingSymbolImports(builder: *Builder, loc: offsets.Loc) error{OutOfMe
             }
         }
     }
-
-    // Sort by file match first (higher priority), then by depth (closest files first)
-    std.mem.sort(MatchingSymbol, matching_symbols.items, {}, struct {
-        fn lessThan(_: void, a: MatchingSymbol, b: MatchingSymbol) bool {
-            // File matches get higher priority
-            if (a.is_file_match != b.is_file_match) {
-                return a.is_file_match;
-            }
-            // Then sort by depth (closest files first)
-            return a.depth < b.depth;
-        }
-    }.lessThan);
-
-    // Create import suggestions for each matching symbol
-    for (matching_symbols.items) |sym| {
-        // Skip if it's the same file
-        if (std.mem.eql(u8, sym.relative_path, std.fs.path.basename(current_file_path))) continue;
-
-        const import_stmt = if (sym.is_file_match)
-            try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\");\n", .{ identifier_name, sym.relative_path })
-        else
-            try std.fmt.allocPrint(builder.arena, "const {s} = @import(\"{s}\").{s};\n", .{ identifier_name, sym.relative_path, identifier_name });
-
-        const insert_loc: offsets.Loc = .{ .start = 0, .end = 0 };
-        const edit = builder.createTextEditLoc(insert_loc, import_stmt);
-        const title = try std.fmt.allocPrint(builder.arena, "Add import for '{s}' from {s}", .{ identifier_name, sym.relative_path });
-        for (builder.actions.items) |action| {
-            if (std.mem.eql(u8, action.title, title)) {
-                log.info("Skipping redundant {s}\n", .{title});
-                continue;
-            }
-        }
-        try builder.actions.append(builder.arena, .{
-            .title = title,
-            .kind = .quickfix,
-            .isPreferred = false,
-            .edit = try builder.createWorkspaceEdit(&.{edit}),
-        });
-    }
-}
+};
