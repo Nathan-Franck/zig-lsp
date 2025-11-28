@@ -1376,13 +1376,19 @@ const MissingSymbolImports = struct {
         // Get the document scope to find public symbols
         const doc_scope = try handle.getDocumentScope();
 
-        const relative_path = switch (target) {
+        const rel_tmp = switch (target) {
             .module => |m| m,
             .path => |p| std.fs.path.relative(builder.arena, self.current_dir, p) catch {
                 log.err("Couldn't build relative path\n", .{});
                 return;
             },
         };
+        // Normalize path separators to forward slashes so imports are written
+        // in a platform independent way (Windows uses backslashes by default).
+        const relative_path = if (std.mem.indexOfScalar(u8, rel_tmp, '\\') != null)
+            try std.mem.replaceOwned(u8, builder.arena, rel_tmp, "\\", "/")
+        else
+            rel_tmp;
         var depth: usize = 0;
         for (relative_path) |c| {
             if (c == std.fs.path.sep) depth += 1;
