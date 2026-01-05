@@ -12,7 +12,7 @@ const types = @import("lsp").types;
 const offsets = @import("../offsets.zig");
 const tracy = @import("tracy");
 const log = std.log.scoped(.code_actions);
-const URI = @import("../uri.zig");
+const URI = @import("../Uri.zig");
 
 pub const Builder = struct {
     arena: std.mem.Allocator,
@@ -1298,9 +1298,9 @@ const MissingSymbolImports = struct {
 
         const identifier_name = offsets.locToSlice(builder.handle.tree.source, loc);
         const matching_symbols = try builder.arena.create(std.ArrayList(MatchingSymbol));
-        matching_symbols.* = .init(builder.arena);
+        matching_symbols.* = .empty;
 
-        const current_file_path = URI.parse(builder.arena, builder.handle.uri) catch {
+        const current_file_path = URI.toFsPath(builder.handle.uri, builder.arena) catch {
             log.err("Couldn't parse uri\n", .{});
             return null;
         };
@@ -1346,8 +1346,8 @@ const MissingSymbolImports = struct {
         const builder = self.builder;
         const identifier_name = self.identifier_name;
 
-        if (builder.analyser.store.config.zig_lib_path) |std_folder| {
-            const std_path = try std.fs.path.join(builder.arena, &.{ std_folder, "std", "std.zig" });
+        if (builder.analyser.store.config.zig_lib_dir) |std_folder| {
+            const std_path = try std.fs.path.join(builder.arena, &.{ std_folder.path.?, "std", "std.zig" });
             log.info("std: {s}\n", .{std_path});
             if (builder.analyser.store.getOrLoadHandle(try URI.fromPath(builder.arena, std_path))) |handle| {
                 try self.checkFileForImports(handle, .{ .module = "std" });
@@ -1419,19 +1419,21 @@ const MissingSymbolImports = struct {
         const builder = self.builder;
 
         // Skip the current file
-        if (std.mem.eql(u8, handle.uri, builder.handle.uri)) return;
+        if (URI.eql(handle.uri, builder.handle.uri)) return;
 
         // Skip non-zig files
-        if (!std.mem.endsWith(u8, handle.uri, ".zig")) return;
+        if (!std.mem.endsWith(u8, handle.uri.raw, ".zig")) return;
 
         // Get the document scope to find public symbols
         const doc_scope = try handle.getDocumentScope();
 
         const rel_tmp = switch (target) {
             .module => |m| m,
-            .path => |p| std.fs.path.relative(builder.arena, self.current_dir, p) catch {
-                log.err("Couldn't build relative path\n", .{});
-                return;
+            .path => |p| blk: {
+                break :blk std.fs.path.relative(builder.arena, self.current_dir, p) catch {
+                    log.err("Couldn't build relative path\n", .{});
+                    return;
+                };
             },
         };
         // Normalize path separators to forward slashes so imports are written
@@ -1451,7 +1453,7 @@ const MissingSymbolImports = struct {
             .path => |p| std.fs.path.stem(p),
         };
         if (std.mem.eql(u8, file_name_without_ext, self.identifier_name)) {
-            try self.matching_symbols.append(.{
+            try self.matching_symbols.append(builder.arena, .{
                 .name = self.identifier_name,
                 .relative_path = relative_path,
                 .depth = depth,
@@ -1468,7 +1470,7 @@ const MissingSymbolImports = struct {
             const decl = doc_scope.declarations.get(@intFromEnum(decl_index));
             if (decl == .ast_node) {
                 const node = decl.ast_node;
-                const main_token = node_tokens[node];
+                const main_token = node_tokens[@intFromEnum(node)];
 
                 const is_pub = if (main_token > 0)
                     token_tags[main_token - 1] == .keyword_pub
@@ -1480,7 +1482,7 @@ const MissingSymbolImports = struct {
                 const name = offsets.identifierTokenToNameSlice(handle.tree, name_token);
 
                 if (std.mem.eql(u8, name, self.identifier_name)) {
-                    try self.matching_symbols.append(.{
+                    try self.matching_symbols.append(builder.arena, .{
                         .name = name,
                         .relative_path = relative_path,
                         .depth = depth,
